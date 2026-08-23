@@ -46,6 +46,14 @@ func NewServer(d Dependencies) *Server {
 	if d.Timeout <= 0 {
 		d.Timeout = 3 * time.Second
 	}
+	// Connect the alert queue to the shared ingestion service so alert
+	// evaluation runs for every successfully committed batch, regardless of
+	// whether it arrived over HTTP or was replayed by the recovery worker.
+	// The same ingest.Service instance is shared by the recovery runner, so
+	// replayed batches generate alerts through the same path.
+	if d.Alerts != nil && d.Ingest != nil {
+		d.Ingest.AttachAlerts(d.Alerts)
+	}
 	return &Server{ingest: d.Ingest, stations: d.Stations, query: d.Query, alerts: d.Alerts, recovery: d.Recovery, logger: d.Logger, timeout: d.Timeout}
 }
 func (s *Server) Handler() http.Handler {
@@ -141,9 +149,10 @@ func (s *Server) batch(w http.ResponseWriter, r *http.Request, stationID string)
 		writeJSON(w, http.StatusBadRequest, batchResponse{BatchID: out.BatchID, StationID: stationID, State: out.State, Error: out.Err.Error()})
 		return
 	}
-	if s.alerts != nil {
-		s.alerts.Enqueue(r.Context(), stationID, req.Readings, time.Now().UTC())
-	}
+	// Alert evaluation now happens inside ingest.Receive, once per
+	// successfully committed (non-duplicate) batch. This keeps the recovery
+	// replay path on equal footing with the HTTP path and prevents duplicate
+	// alerts on resubmission.
 	writeJSON(w, http.StatusAccepted, batchResponse{BatchID: out.BatchID, StationID: stationID, State: out.State, Duplicate: out.Duplicate, Cursor: out.Cursor})
 }
 func (s *Server) readings(w http.ResponseWriter, r *http.Request, id string) {

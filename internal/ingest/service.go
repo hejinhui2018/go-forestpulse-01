@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"time"
 
+	"example.com/forestpulse/internal/alerts"
 	"example.com/forestpulse/internal/audit"
 	"example.com/forestpulse/internal/clock"
 	"example.com/forestpulse/internal/domain"
@@ -28,11 +29,19 @@ type Service struct {
 	clock     clock.Clock
 	metrics   *Metrics
 	audit     *audit.Journal
+	alerts    *alerts.Queue
 }
 
 func NewService(st store.Store, clk clock.Clock, maxBatch int) *Service {
 	return &Service{store: st, clock: clk, metrics: &Metrics{}, audit: audit.NewJournal(2000), validator: Validator{MaxBatch: maxBatch, MaxAge: 48 * time.Hour, Now: clk.Now}}
 }
+
+// AttachAlerts connects the alert queue so that alert evaluation runs as part
+// of ingestion. It is separated from the constructor so the ingest package
+// keeps no hard dependency on alerts at construction time. Alert evaluation
+// happens only after a durable, non-duplicate commit so the same batch can be
+// retried without producing duplicate alerts.
+func (s *Service) AttachAlerts(q *alerts.Queue) { s.alerts = q }
 
 func (s *Service) Receive(ctx context.Context, input model.ReadingBatch) Outcome {
 	batch := Normalize(input, s.clock.Now())
@@ -56,6 +65,14 @@ func (s *Service) Receive(ctx context.Context, input model.ReadingBatch) Outcome
 	out.State = model.BatchCommitted
 	s.metrics.Record(out)
 	_, _ = s.audit.Append(ctx, "batch_committed", batch.ID, Describe(out), s.clock.Now())
+	// Alert evaluation is part of the ingestion contract: a batch that was
+	// durably committed for the first time (not a duplicate resubmit or
+	// replay of an already-committed batch) generates one alert per dangerous
+	// reading. Failed commits return above, and duplicates carry their own
+	// committed state, so this never alerts twice for the same batch.
+	if !out.Duplicate && s.alerts != nil {
+		s.alerts.Enqueue(ctx, batch.StationID, batch.Readings, s.clock.Now())
+	}
 	return out
 }
 
