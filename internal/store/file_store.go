@@ -189,21 +189,14 @@ func (s *FileStore) CommitBatch(ctx context.Context, batch model.ReadingBatch, n
 		return CommitResult{}, domain.E(domain.KindConflict, "commit batch sequence", fmt.Sprintf("expected %d got %d", cursor.LastSequence+1, batch.FirstSequence()), nil)
 	}
 	if err := s.injectFaultLocked(batch); err != nil {
+		// A failed batch is the retry unit: it must not advance the cursor or
+		// persist partial readings. The cursor may only describe readings
+		// that remain available after restart, so advancing it to the batch's
+		// last sequence while only a prefix is durable would let the cursor
+		// outrun the real contiguous readings. Record the batch as failed and
+		// leave cursor, readings, and station state untouched so recovery can
+		// replay the whole batch from cursor.LastSequence+1.
 		next := cloneState(s.state)
-		prefix := batch.Readings
-		if s.fault != nil {
-			for i, reading := range batch.Readings {
-				if reading.Sequence == s.fault.FailOnSequence {
-					prefix = batch.Readings[:i]
-					break
-				}
-			}
-		}
-		next.Readings[batch.StationID] = append(next.Readings[batch.StationID], prefix...)
-		next.Cursors[batch.StationID] = model.Cursor{StationID: batch.StationID, LastSequence: batch.LastSequence(), UpdatedAt: now}
-		station.LastSequence = batch.LastSequence()
-		station.UpdatedAt = now
-		next.Stations[batch.StationID] = station
 		next.Batches[batch.ID] = model.BatchRecord{Batch: batch.Copy(), State: model.BatchFailed, Attempts: 1, LastError: err.Error(), UpdatedAt: now}
 		if persistErr := s.persistStateLocked(next); persistErr == nil {
 			s.state = next

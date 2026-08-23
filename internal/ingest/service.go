@@ -71,15 +71,16 @@ func (s *Service) Replay(ctx context.Context, limit int) ([]Outcome, error) {
 	}
 	out := make([]Outcome, 0, len(records))
 	for _, record := range records {
+		// A failed/pending batch is the retry unit and must be replayed in
+		// full. The store is the single source of truth for what is already
+		// durable: if the same batch ID is already committed it returns
+		// Duplicate, and a sequence that does not continue the cursor fails
+		// without advancing it. We must not second-guess the cursor here,
+		// because a cursor that outran a partial write is exactly the gap a
+		// retry has to close; skipping "already seen" sequences from a stale
+		// cursor would drop the missing readings permanently and could make
+		// the cursor and the readable readings disagree.
 		batch := record.Batch.Copy()
-		if cursor, cursorErr := s.store.Cursor(ctx, batch.StationID); cursorErr == nil && cursor.LastSequence >= batch.FirstSequence() {
-			offset := int(cursor.LastSequence - batch.FirstSequence() + 1)
-			if offset >= len(batch.Readings) {
-				out = append(out, Outcome{BatchID: batch.ID, StationID: batch.StationID, Duplicate: true, Cursor: cursor, State: model.BatchCommitted})
-				continue
-			}
-			batch.Readings = append([]model.Reading(nil), batch.Readings[offset:]...)
-		}
 		result := s.Receive(ctx, batch)
 		if result.Err != nil {
 			_ = s.store.MarkBatchFailed(ctx, record.Batch.ID, result.Err, s.clock.Now())
